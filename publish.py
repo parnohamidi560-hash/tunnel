@@ -72,19 +72,17 @@ def fetch_manifest() -> list:
 
 
 def download_video(filename: str, dest: Path) -> bool:
-    """Download .mp4.b64 dari GitHub lalu decode ke mp4."""
-    url = QUEUE_RAW + quote(filename + ".b64")
+    """Download mp4 langsung dari GitHub queue (raw binary)."""
+    url = QUEUE_RAW + quote(filename)
     try:
         r = requests.get(url, timeout=300)
         if r.status_code != 200:
             logging.error("Download %s -> HTTP %s", filename, r.status_code)
             return False
-        raw = base64.b64decode(r.content)
-        if len(raw) < 1000 or not raw.startswith(b"\x00\x00\x00"):
-            # sanity check longgar: file mp4/ftyp
-            if b"ftyp" not in raw[:32]:
-                logging.error("Download %s: isi bukan mp4 valid", filename)
-                return False
+        raw = r.content
+        if len(raw) < 100000 or b"ftyp" not in raw[:32]:
+            logging.error("Download %s: isi bukan mp4 valid (%d bytes)", filename, len(raw))
+            return False
         dest.write_bytes(raw)
         return True
     except Exception as e:
