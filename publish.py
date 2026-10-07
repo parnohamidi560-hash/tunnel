@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-fb-publisher v3: ambil video dari GitHub queue lalu upload ke FB Page.
+fb-publisher v4: ambil video dari GitHub queue lalu upload ke FB Page.
 
 Jalan di VPS milik parno (bukan di Muse) — tanpa approval card.
 Dipicu via cron tiap 8 jam.
 
-Alur:
-  1. GET manifest dari GitHub (repo publik fb-video-queue)
-  2. Download .mp4.b64 yang belum pernah dipublish -> decode -> mp4
-  3. Upload ke Facebook Page via Graph API (caption dari manifest)
-  4. Tandai published di published.log, pindahkan ke done/
-
-Kebutuhan:
-  ~/.fb-publisher/.page_token  (600) — Page Access Token (pages_manage_posts)
+Pengaman kegagalan:
+  - Video HANYA dipindah ke done/ bila Facebook mengembalikan ID sukses.
+  - Gagal download/upload karena jaringan: retry otomatis max 3x (antar run),
+    tercatat di attempts.json. Masih gagal -> karantina di failed/.
+  - Upload yang responsnya HILANG di tengah jalan (timeout/exception):
+    TIDAK di-retry otomatis -> karantina, cegah publish dobel.
+    Cek manual di page, lalu hapus dari failed/ bila perlu tayang ulang.
+  - Token kedaluwarsa/dicabut: run langsung berhenti, tidak spam.
+  - published.log: satu video tidak akan dipublish dua kali.
 """
 import argparse
-import base64
+import json
 import sys
 import shutil
 import logging
@@ -33,7 +34,9 @@ DONE = BASE / "done"
 FAILED = BASE / "failed"
 TOKEN_FILE = Path.home() / ".fb-publisher" / ".page_token"
 PUBLISHED_LOG = BASE / "published.log"
+ATTEMPTS_FILE = BASE / "attempts.json"
 LOG_FILE = BASE / "publish.log"
+MAX_ATTEMPTS = 3
 
 logging.basicConfig(
     filename=str(LOG_FILE),
@@ -62,6 +65,38 @@ def published_set() -> set:
 def mark_published(filename: str) -> None:
     with open(PUBLISHED_LOG, "a") as f:
         f.write(filename + "\n")
+    attempts = load_attempts()
+    attempts.pop(filename, None)
+    save_attempts(attempts)
+
+
+def load_attempts() -> dict:
+    try:
+        return json.loads(ATTEMPTS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_attempts(d: dict) -> None:
+    ATTEMPTS_FILE.write_text(json.dumps(d))
+
+
+def note_attempt(filename: str) -> int:
+    d = load_attempts()
+    d[filename] = d.get(filename, 0) + 1
+    save_attempts(d)
+    return d[filename]
+
+
+def quarantine(mp4: Path, reason: str) -> None:
+    logging.error("KARANTINA %s: %s", mp4.name, reason)
+    try:
+        shutil.move(str(mp4), FAILED / mp4.name)
+    except Exception as e:
+        logging.error("Gagal pindah ke failed/: %s", e)
+    d = load_attempts()
+    d.pop(mp4.name, None)
+    save_attempts(d)
 
 
 def fetch_manifest() -> list:
@@ -72,7 +107,6 @@ def fetch_manifest() -> list:
 
 
 def download_video(filename: str, dest: Path) -> bool:
-    """Download mp4 langsung dari GitHub queue (raw binary)."""
     url = QUEUE_RAW + quote(filename)
     try:
         r = requests.get(url, timeout=300)
@@ -115,6 +149,7 @@ def main() -> None:
         d.mkdir(parents=True, exist_ok=True)
     token = read_token()
     done = published_set()
+    attempts = load_attempts()
 
     try:
         videos = fetch_manifest()
@@ -130,17 +165,28 @@ def main() -> None:
             continue
         if n >= args.limit:
             break
-        mp4 = INCOMING / fn
-        logging.info("Download %s ...", fn)
-        if not download_video(fn, mp4):
+        if attempts.get(fn, 0) >= MAX_ATTEMPTS:
+            logging.warning("Skip %s: sudah %dx gagal, menunggu tindakan manual", fn, MAX_ATTEMPTS)
             continue
+
+        mp4 = INCOMING / fn
+        if not mp4.exists():
+            logging.info("Download %s ...", fn)
+            if not download_video(fn, mp4):
+                c = note_attempt(fn)
+                logging.warning("Download %s gagal (percobaan %d/%d)", fn, c, MAX_ATTEMPTS)
+                continue
+
         caption = (v.get("caption") or fn).strip()
         logging.info("Upload %s (%d bytes)", fn, mp4.stat().st_size)
         try:
             res = upload_video(mp4, caption, token)
         except Exception as e:
-            logging.error("Upload %s gagal (exception): %s", fn, e)
+            # Respons hilang di tengah jalan -> JANGAN retry otomatis (risiko dobel).
+            quarantine(mp4, f"upload exception (hasil tidak pasti): {e}. "
+                            "Cek manual di page; hapus dari failed/ bila perlu tayang ulang.")
             continue
+
         body = res["body"]
         if res["status"] == 200 and body.get("id"):
             logging.info("OK %s -> video id %s", fn, body["id"])
@@ -148,12 +194,16 @@ def main() -> None:
             shutil.move(str(mp4), DONE / mp4.name)
             n += 1
         else:
-            logging.error("GAGAL %s: %s %s", fn, res["status"], str(body)[:300])
             err = str(body).lower()
             if "expired" in err or "permission" in err or "oauth" in err:
-                logging.error("Kemungkinan token bermasalah — hentikan run ini.")
+                logging.error("Token bermasalah — hentikan run ini: %s", str(body)[:200])
                 break
-            shutil.move(str(mp4), FAILED / mp4.name)
+            c = note_attempt(fn)
+            if c >= MAX_ATTEMPTS:
+                quarantine(mp4, f"upload gagal {c}x: {res['status']} {str(body)[:200]}")
+            else:
+                logging.warning("Upload %s gagal (percobaan %d/%d), retry run berikutnya",
+                                fn, c, MAX_ATTEMPTS)
     if n == 0:
         logging.info("Tidak ada video baru untuk dipublish.")
 
